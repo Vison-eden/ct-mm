@@ -1,0 +1,32 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Data and outputs
+data/
+dataset/
+datasets/
+patches/
+ct_preprocessed/
+runs/
+results/
+outputs/
+checkpoints/
+weights/
+
+# Medical image and model files
+*.nii
+*.nii.gz
+*.nrrd
+*.mha
+*.mhd
+*.dcm
+*.npy
+*.npz
+*.pt
+*.pth
+
+# Logs and temporary files
+*.log
+*.csv~
+.DS_Store
