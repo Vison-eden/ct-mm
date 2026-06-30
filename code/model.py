@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Public model definitions for multimodal lung nodule classification.
-
-This release keeps the basic model interfaces for readability and compatibility,
-while using simplified baseline components. Experimental fusion and gating
-details are intentionally omitted from the public version.
-"""
 
 from __future__ import annotations
 
@@ -24,14 +17,6 @@ except Exception:
 
 
 class TabEncoder(nn.Module):
-    """
-    Simplified tabular encoder.
-
-    Public version:
-    - uses a plain MLP over structured features and density embedding;
-    - does not expose feature-token modeling or feature-order-specific design.
-    """
-
     def __init__(
         self,
         feature_names: Sequence[str],
@@ -41,19 +26,17 @@ class TabEncoder(nn.Module):
     ) -> None:
         super().__init__()
 
+        del density_num_classes
+
         self.feature_names = list(feature_names)
         self.n_features = len(self.feature_names)
-        self.density_num_classes = int(density_num_classes)
 
-        self.density_embedding = nn.Embedding(self.density_num_classes, 16)
-
-        self.encoder = nn.Sequential(
-            nn.Linear(self.n_features + 16, d_model),
+        self.net = nn.Sequential(
+            nn.Linear(self.n_features + 1, d_model),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
             nn.Linear(d_model, d_model),
             nn.ReLU(inplace=True),
-            nn.LayerNorm(d_model),
         )
 
     def forward(
@@ -62,97 +45,59 @@ class TabEncoder(nn.Module):
         x_density: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        x_density = x_density.long().view(-1)
-        x_density = x_density.clamp(0, self.density_num_classes - 1)
+        x_density = x_density.float().view(-1, 1)
+        x = torch.cat([x_num.float(), x_density], dim=1)
 
-        density = self.density_embedding(x_density)
-        x = torch.cat([x_num.float(), density], dim=1)
+        out = self.net(x)
 
-        g_tab = self.encoder(x)
-
-        # Keep a token-like output for interface compatibility.
-        tok_tab = g_tab.unsqueeze(1)
-
-        return tok_tab, g_tab
+        return out.unsqueeze(1), out
 
 
 class ResNet3DBackbone(nn.Module):
-    """
-    Standard 3D CNN backbone.
-
-    Public version keeps only the common torchvision video backbones.
-    """
-
-    def __init__(self, name: str = "r2plus1d_18", in_channels: int = 1) -> None:
+    def __init__(
+        self,
+        name: str = "r2plus1d_18",
+        in_channels: int = 1,
+    ) -> None:
         super().__init__()
 
-        import torchvision.models.video as video_models
+        del name
 
-        builders = {
-            "r3d_18": video_models.r3d_18,
-            "mc3_18": video_models.mc3_18,
-            "r2plus1d_18": video_models.r2plus1d_18,
-        }
+        self.out_dim = 128
 
-        if name not in builders:
-            raise ValueError(f"Unsupported 3D backbone: {name}")
+        self.net = nn.Sequential(
+            nn.Conv3d(in_channels, 16, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(16),
+            nn.ReLU(inplace=True),
+            nn.MaxPool3d(kernel_size=2),
 
-        try:
-            net = builders[name](weights=None)
-        except TypeError:
-            net = builders[name](pretrained=False)
+            nn.Conv3d(16, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool3d(kernel_size=2),
 
-        old_conv = net.stem[0]
+            nn.Conv3d(32, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(64),
+            nn.ReLU(inplace=True),
 
-        if old_conv.in_channels != in_channels:
-            new_conv = nn.Conv3d(
-                in_channels,
-                old_conv.out_channels,
-                kernel_size=old_conv.kernel_size,
-                stride=old_conv.stride,
-                padding=old_conv.padding,
-                bias=False,
-            )
+            nn.AdaptiveAvgPool3d(1),
+        )
 
-            nn.init.kaiming_normal_(
-                new_conv.weight,
-                mode="fan_out",
-                nonlinearity="relu",
-            )
+        self.proj = nn.Linear(64, self.out_dim)
 
-            if old_conv.weight.shape[1] == 3 and in_channels == 1:
-                with torch.no_grad():
-                    new_conv.weight.copy_(
-                        old_conv.weight.mean(dim=1, keepdim=True)
-                    )
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-            net.stem[0] = new_conv
-
-        self.net = net
-        self.out_dim = net.fc.in_features
-        self.net.fc = nn.Identity()
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = self.net.stem(x)
-        x = self.net.layer1(x)
-        x = self.net.layer2(x)
-        x = self.net.layer3(x)
-        feat = self.net.layer4(x)
-
-        pooled = F.adaptive_avg_pool3d(feat, 1).flatten(1)
+        feat = self.net(x)
+        pooled = feat.flatten(1)
+        pooled = self.proj(pooled)
 
         return pooled, feat
 
 
 class ImageEncoder3D(nn.Module):
-    """
-    Simplified image encoder.
-
-    Public version:
-    - uses 3D CNN global pooled features;
-    - omits additional token-transformer refinement.
-    """
-
     def __init__(
         self,
         backbone: str = "r2plus1d_18",
@@ -165,25 +110,24 @@ class ImageEncoder3D(nn.Module):
 
         del d_model, transformer_layers, dropout
 
-        self.backbone = ResNet3DBackbone(backbone, in_channels)
+        self.backbone = ResNet3DBackbone(
+            name=backbone,
+            in_channels=in_channels,
+        )
+
         self.out_dim = self.backbone.out_dim
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        pooled, _feat = self.backbone(x)
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        # Keep a token-like output for interface compatibility.
-        tokens = pooled.unsqueeze(1)
+        pooled, feat = self.backbone(x)
 
-        return pooled, tokens
+        return pooled, pooled.unsqueeze(1)
 
 
 class FusionHead(nn.Module):
-    """
-    Public baseline fusion head.
-
-    This is a simple concatenation-based fusion module.
-    """
-
     def __init__(
         self,
         d_img: int,
@@ -193,12 +137,9 @@ class FusionHead(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.classifier = nn.Sequential(
-            nn.Linear(d_img + d_tab, 256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(256, out_classes),
-        )
+        del dropout
+
+        self.classifier = nn.Linear(d_img + d_tab, out_classes)
 
     def forward(
         self,
@@ -207,19 +148,11 @@ class FusionHead(nn.Module):
     ) -> torch.Tensor:
 
         x = torch.cat([g_img, g_tab], dim=1)
-        logits = self.classifier(x)
 
-        return logits
+        return self.classifier(x)
 
 
 class BiCrossFusion(nn.Module):
-    """
-    Compatibility wrapper.
-
-    The original experimental fusion implementation is not included in the
-    public release. This class now behaves as a plain concatenation baseline.
-    """
-
     def __init__(
         self,
         d_img: int,
@@ -229,7 +162,7 @@ class BiCrossFusion(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.fusion = FusionHead(
+        self.head = FusionHead(
             d_img=d_img,
             d_tab=d_tab,
             out_classes=out_classes,
@@ -246,15 +179,15 @@ class BiCrossFusion(nn.Module):
 
         del tok_img, tok_tab
 
-        logits = self.fusion(g_img, g_tab)
+        logits = self.head(g_img, g_tab)
 
-        # Empty placeholders for compatibility only.
         z_img = torch.empty(
             g_img.size(0),
             0,
             device=g_img.device,
             dtype=g_img.dtype,
         )
+
         z_tab = torch.empty(
             g_tab.size(0),
             0,
@@ -266,12 +199,6 @@ class BiCrossFusion(nn.Module):
 
 
 class GatingHead(nn.Module):
-    """
-    Compatibility placeholder.
-
-    Dynamic gating details are not included in this public release.
-    """
-
     def __init__(
         self,
         d_img: int,
@@ -293,15 +220,12 @@ class GatingHead(nn.Module):
 
         del g_tab, density_id, size_z
 
-        batch_size = g_img.size(0)
-        weights = torch.full(
-            (batch_size, 3),
+        return torch.full(
+            (g_img.size(0), 3),
             1.0 / 3.0,
             device=g_img.device,
             dtype=g_img.dtype,
         )
-
-        return weights
 
 
 class ImgOnlyModel(nn.Module):
@@ -318,23 +242,18 @@ class ImgOnlyModel(nn.Module):
     ) -> None:
         super().__init__()
 
-        del vit_patch, vit_depth
+        del d_img, drop, img_trans_layers, vit_patch, vit_depth
 
         self.out_classes = int(out_classes)
 
         self.img = ImageEncoder3D(
             backbone=img_backbone,
             in_channels=in_ch,
-            d_model=d_img,
-            transformer_layers=img_trans_layers,
-            dropout=drop,
         )
 
-        self.head = nn.Sequential(
-            nn.Linear(self.img.out_dim, 256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(drop),
-            nn.Linear(256, self.out_classes),
+        self.head = nn.Linear(
+            self.img.out_dim,
+            self.out_classes,
         )
 
     def forward(
@@ -344,6 +263,7 @@ class ImgOnlyModel(nn.Module):
         _ld_z=None,
         _den_id=None,
     ):
+
         g_img, _ = self.img(x_img)
         logits = self.head(g_img)
 
@@ -369,17 +289,15 @@ class TabOnlyModel(nn.Module):
         self.out_classes = int(out_classes)
 
         self.txt = TabEncoder(
-            names,
+            feature_names=names,
             d_model=d_txt,
             dropout=drop,
             density_num_classes=den_num_classes,
         )
 
-        self.head = nn.Sequential(
-            nn.Linear(d_txt, 256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(drop),
-            nn.Linear(256, self.out_classes),
+        self.head = nn.Linear(
+            d_txt,
+            self.out_classes,
         )
 
     def forward(
@@ -389,7 +307,9 @@ class TabOnlyModel(nn.Module):
         _ld_z=None,
         _den_id=None,
     ):
+
         x_num, x_density = x_tab
+
         _, g_tab = self.txt(x_num, x_density)
         logits = self.head(g_tab)
 
@@ -400,17 +320,6 @@ class TabOnlyModel(nn.Module):
 
 
 class UnifiedModel(nn.Module):
-    """
-    Public multimodal model.
-
-    Public version:
-    - image branch: 3D CNN encoder;
-    - tabular branch: MLP encoder;
-    - fusion branch: concatenation classifier;
-    - omitted: experimental cross-attention, adaptive gating, probability-anchor
-      fusion, and contrastive auxiliary heads.
-    """
-
     def __init__(
         self,
         mode: str = "mm",
@@ -431,7 +340,14 @@ class UnifiedModel(nn.Module):
     ) -> None:
         super().__init__()
 
-        del mode, use_gate, mix_rule, alpha_cap, vit_patch, vit_depth
+        del mode
+        del img_trans_layers
+        del d_img
+        del use_gate
+        del mix_rule
+        del alpha_cap
+        del vit_patch
+        del vit_depth
 
         self.out_classes = int(task_out_classes)
 
@@ -440,30 +356,23 @@ class UnifiedModel(nn.Module):
         self.img = ImageEncoder3D(
             backbone=img_backbone,
             in_channels=in_ch,
-            d_model=d_img,
-            transformer_layers=img_trans_layers,
-            dropout=drop,
         )
 
         self.txt = TabEncoder(
-            names,
+            feature_names=names,
             d_model=d_txt,
             dropout=drop,
             density_num_classes=den_num_classes,
         )
 
-        self.head_img = nn.Sequential(
-            nn.Linear(self.img.out_dim, 256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(drop),
-            nn.Linear(256, self.out_classes),
+        self.head_img = nn.Linear(
+            self.img.out_dim,
+            self.out_classes,
         )
 
-        self.head_txt = nn.Sequential(
-            nn.Linear(d_txt, 256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(drop),
-            nn.Linear(256, self.out_classes),
+        self.head_txt = nn.Linear(
+            d_txt,
+            self.out_classes,
         )
 
         self.fuse = FusionHead(
@@ -480,23 +389,26 @@ class UnifiedModel(nn.Module):
         ld_z: torch.Tensor,
         den_id: torch.Tensor,
     ):
+
         del ld_z, den_id
 
         x_num, x_density = x_tab
 
-        g_img, _tok_img = self.img(x_img)
-        _tok_tab, g_tab = self.txt(x_num, x_density)
+        g_img, tok_img = self.img(x_img)
+        tok_tab, g_tab = self.txt(x_num, x_density)
+
+        del tok_img, tok_tab
 
         logits_img = self.head_img(g_img)
         logits_txt = self.head_txt(g_tab)
-        logits_fuse = self.fuse(g_img, g_tab)
+        logits = self.fuse(g_img, g_tab)
+
+        if self.out_classes == 1:
+            logits = logits.squeeze(1)
 
         extra = {
             "logits_img": logits_img,
             "logits_txt": logits_txt,
         }
 
-        if self.out_classes == 1:
-            logits_fuse = logits_fuse.squeeze(1)
-
-        return logits_fuse, extra
+        return logits, extra
