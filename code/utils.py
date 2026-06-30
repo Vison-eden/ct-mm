@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Utilities for tri-class multimodal lung nodule classification."""
 
 from __future__ import annotations
 
@@ -12,7 +11,6 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
@@ -26,17 +24,7 @@ from torch.utils.data import Dataset
 IDX2NAME = {0: "AAH/AIS", 1: "MIA", 2: "IAC"}
 NAME2IDX = {v: k for k, v in IDX2NAME.items()}
 
-FEATS_NUM = [
-    "spiculation",
-    "lobulation",
-    "smooth_sharp",
-    "bronchus_sign",
-    "pleural_indentation",
-    "cord_sign",
-    "irregular",
-    "round_like",
-    "vascular_convergence",
-]
+FEATS_NUM = [f"feat_{i:02d}" for i in range(1, 10)]
 FEATS_ALL = FEATS_NUM + ["density"]
 
 DENSITY_ORDER = ["UNK", "GGO", "PartSolid", "Solid"]
@@ -47,19 +35,19 @@ LABEL_ALIASES = {
     "aah/ais": "AAH/AIS",
     "aah_ais": "AAH/AIS",
     "aah-ais": "AAH/AIS",
-    "pre-invasive": "AAH/AIS",
     "preinvasive": "AAH/AIS",
+    "pre-invasive": "AAH/AIS",
     "mia": "MIA",
     "iac": "IAC",
 }
 
 
 def seed_all(seed: int) -> None:
+    seed = int(seed)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = True
 
 
 def resolve_device(gpu: int) -> torch.device:
@@ -77,17 +65,20 @@ def canonical_label(x):
     if pd.isna(x):
         return None
 
-    if isinstance(x, (int, np.integer)) and int(x) in IDX2NAME:
-        return int(x)
+    if isinstance(x, (int, np.integer)):
+        v = int(x)
+        return v if v in IDX2NAME else None
 
-    if isinstance(x, float) and np.isfinite(x) and int(x) in IDX2NAME:
-        return int(x)
+    if isinstance(x, float) and np.isfinite(x):
+        v = int(x)
+        return v if v in IDX2NAME else None
 
     s = str(x).strip()
+
     if s in NAME2IDX:
         return NAME2IDX[s]
 
-    key = s.lower().replace(" ", "")
+    key = s.lower().replace(" ", "").replace("-", "_")
     key = key.replace("preinvasivelesion", "preinvasive")
     key = LABEL_ALIASES.get(key, key)
 
@@ -97,37 +88,37 @@ def canonical_label(x):
     return None
 
 
-def canonical_density(x: str) -> str:
+def canonical_density(x) -> str:
     if pd.isna(x):
         return "UNK"
 
     s = str(x).strip().lower().replace(" ", "").replace("_", "-")
 
-    if s in {"ggo", "ggn", "groundglass", "ground-glass", "groundglassnodule"}:
+    if s in {"ggo", "ggn", "groundglass", "ground-glass"}:
         return "GGO"
 
-    if s in {"partsolid", "part-solid", "mixed", "mixedggo", "mixed-ground-glass"}:
+    if s in {"partsolid", "part-solid", "mixed"}:
         return "PartSolid"
 
-    if s in {"solid", "solidnodule"}:
+    if s in {"solid"}:
         return "Solid"
 
     return "UNK"
 
 
-def to_float01(x):
+def to_float_safe(x):
     if pd.isna(x):
         return np.nan
 
     if isinstance(x, str):
         s = x.strip().lower()
-        if s in {"yes", "y", "true", "present", "positive"}:
+        if s in {"yes", "y", "true", "present", "positive", "1"}:
             return 1.0
-        if s in {"no", "n", "false", "absent", "negative"}:
+        if s in {"no", "n", "false", "absent", "negative", "0"}:
             return 0.0
 
     try:
-        return 1.0 if float(x) > 0 else 0.0
+        return float(x)
     except Exception:
         return np.nan
 
@@ -148,7 +139,7 @@ def expand_structured_features(
     for col in FEATS_NUM:
         if col not in out.columns:
             out[col] = np.nan
-        out[col] = out[col].apply(to_float01)
+        out[col] = out[col].apply(to_float_safe)
 
     return out, list(FEATS_NUM)
 
@@ -162,15 +153,65 @@ def _choose_samples_csv(args) -> str:
     raise SystemExit("Please provide --samples_csv.")
 
 
+def _make_generic_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    existing = [c for c in FEATS_NUM if c in out.columns]
+    if existing:
+        for c in FEATS_NUM:
+            if c not in out.columns:
+                out[c] = np.nan
+            out[c] = out[c].apply(to_float_safe)
+        return out
+
+    ignore = {
+        "path",
+        "label",
+        "label_idx",
+        "label_group",
+        "category",
+        "tri_label",
+        "subject",
+        "nod_id",
+        "density",
+        "center_z",
+        "center_y",
+        "center_x",
+        "spacing_z",
+        "spacing_y",
+        "spacing_x",
+        "size_mm",
+        "size_pix",
+        "channels",
+    }
+
+    numeric_candidates = []
+    for col in out.columns:
+        if col in ignore:
+            continue
+        values = pd.to_numeric(out[col], errors="coerce")
+        if values.notna().sum() > 0:
+            numeric_candidates.append(col)
+
+    for i, feat in enumerate(FEATS_NUM):
+        if i < len(numeric_candidates):
+            out[feat] = pd.to_numeric(out[numeric_candidates[i]], errors="coerce")
+        else:
+            out[feat] = np.nan
+
+    return out
+
+
 def read_samples_for_task(args) -> pd.DataFrame:
     task = getattr(args, "task", "tri")
     if task != "tri":
-        raise ValueError("This public release supports the tri-class task only.")
+        raise ValueError("Only tri-class classification is supported in this release.")
 
     df = pd.read_csv(_choose_samples_csv(args))
+    df.columns = [str(c).strip().replace("\ufeff", "") for c in df.columns]
 
     if "path" not in df.columns:
-        raise RuntimeError("samples.csv must contain a 'path' column pointing to .npy CT patches.")
+        raise RuntimeError("samples.csv must contain a 'path' column.")
 
     if "nod_id" not in df.columns:
         df["nod_id"] = df["path"].map(lambda p: osp.splitext(osp.basename(str(p)))[0])
@@ -179,7 +220,7 @@ def read_samples_for_task(args) -> pd.DataFrame:
         df["subject"] = df["nod_id"].map(norm_id_core)
 
     if "density" not in df.columns:
-        raise RuntimeError("samples.csv must contain a 'density' column.")
+        df["density"] = "UNK"
 
     df["density"] = df["density"].apply(canonical_density)
 
@@ -208,14 +249,9 @@ def read_samples_for_task(args) -> pd.DataFrame:
 
     if "long_diameter" not in df.columns:
         df["long_diameter"] = np.nan
-
     df["long_diameter"] = pd.to_numeric(df["long_diameter"], errors="coerce")
 
-    if "solid_core_diam" in df.columns:
-        sd = pd.to_numeric(df["solid_core_diam"], errors="coerce")
-        ld = pd.to_numeric(df["long_diameter"], errors="coerce")
-        df["solid_ratio"] = (sd / ld.replace(0, np.nan)).clip(lower=0, upper=10)
-
+    df = _make_generic_features(df)
     df, _ = expand_structured_features(df)
 
     return df.reset_index(drop=True)
@@ -227,31 +263,18 @@ class Aug3D:
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
         if self.mode == "none":
-            return x
+            return x.astype(np.float32)
 
         if np.random.rand() < 0.5:
-            x = np.flip(x, axis=1).copy()
+            x = np.flip(x, axis=-1).copy()
+
         if np.random.rand() < 0.5:
-            x = np.flip(x, axis=2).copy()
-        if np.random.rand() < 0.5:
-            x = np.flip(x, axis=3).copy()
-        if np.random.rand() < 0.5:
-            x = np.rot90(x, np.random.randint(0, 4), axes=(2, 3)).copy()
+            x = np.flip(x, axis=-2).copy()
 
-        if self.mode in {"light", "strong"} and np.random.rand() < 0.5:
-            x = x + 0.02 * np.random.randn(*x.shape).astype(np.float32)
+        if self.mode == "light" and np.random.rand() < 0.3:
+            x = x + 0.01 * np.random.randn(*x.shape).astype(np.float32)
 
-        if self.mode == "strong":
-            if np.random.rand() < 0.5:
-                scale = 1.0 + (np.random.rand() * 2.0 - 1.0) * 0.15
-                shift = (np.random.rand() * 2.0 - 1.0) * 0.15
-                x = x * scale + shift
-
-            if np.random.rand() < 0.5:
-                gamma = 2.0 ** ((np.random.rand() * 2.0 - 1.0) * 0.25)
-                x = np.sign(x) * (np.abs(x) ** gamma)
-
-        return np.clip(x, -6.0, 6.0).astype(np.float32)
+        return x.astype(np.float32)
 
 
 class LungDataset(Dataset):
@@ -267,7 +290,7 @@ class LungDataset(Dataset):
         load_image: bool = True,
     ) -> None:
         if task != "tri":
-            raise ValueError("This dataset supports the tri-class task only.")
+            raise ValueError("Only tri-class classification is supported in this release.")
 
         self.df = df.reset_index(drop=True).copy()
         self.stats = stats
@@ -280,16 +303,27 @@ class LungDataset(Dataset):
 
         tab = []
         for col in self.tab_columns:
+            if col not in self.df.columns:
+                self.df[col] = np.nan
             tab.append(pd.to_numeric(self.df[col], errors="coerce").astype(float).values)
 
         tab = np.stack(tab, axis=1).astype(np.float32)
 
-        mean = np.array([stats["mean"][c] for c in self.tab_columns], dtype=np.float32)
-        std = np.array([stats["std"][c] for c in self.tab_columns], dtype=np.float32)
+        mean = np.array(
+            [float(stats.get("mean", {}).get(c, 0.0)) for c in self.tab_columns],
+            dtype=np.float32,
+        )
+        std = np.array(
+            [float(stats.get("std", {}).get(c, 1.0)) for c in self.tab_columns],
+            dtype=np.float32,
+        )
         std[std < 1e-6] = 1.0
 
         tab = np.where(np.isnan(tab), mean[None, :], tab)
         self.tab = (tab - mean[None, :]) / std[None, :]
+
+        if "density" not in self.df.columns:
+            self.df["density"] = "UNK"
 
         density = self.df["density"].astype(str).map(
             lambda s: s if s in self.den_vocab else "UNK"
@@ -306,42 +340,43 @@ class LungDataset(Dataset):
     def __len__(self) -> int:
         return len(self.df)
 
+    def _load_patch(self, path: str) -> np.ndarray:
+        arr = np.load(path)
+
+        if arr.ndim == 3:
+            arr = arr[None, ...]
+
+        if arr.ndim != 4:
+            raise RuntimeError(
+                f"Expected patch shape (C,D,H,W) or (D,H,W), got {arr.shape}."
+            )
+
+        if self.in_ch is not None and arr.shape[0] != self.in_ch:
+            if arr.shape[0] > self.in_ch:
+                arr = arr[: self.in_ch]
+            else:
+                pad = np.repeat(arr[-1:], self.in_ch - arr.shape[0], axis=0)
+                arr = np.concatenate([arr, pad], axis=0)
+
+        arr = arr.astype(np.float32)
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+        mu = float(arr.mean())
+        sd = float(arr.std())
+        if sd < 1e-6:
+            sd = 1.0
+
+        arr = ((arr - mu) / sd).astype(np.float32)
+        arr = np.clip(arr, -5.0, 5.0)
+
+        if self.train and self.augment is not None:
+            arr = self.augment(arr)
+
+        return arr.astype(np.float32)
+
     def __getitem__(self, idx: int):
         if self.load_image:
-            arr = np.load(self.df.iloc[idx]["path"])
-
-            if arr.ndim == 3:
-                arr = arr[None, ...]
-
-            if arr.ndim != 4:
-                raise RuntimeError(
-                    f"Expected a 3D patch with shape (C,D,H,W) or (D,H,W), got {arr.shape}."
-                )
-
-            if self.in_ch is not None and arr.shape[0] != self.in_ch:
-                if arr.shape[0] > self.in_ch:
-                    arr = arr[: self.in_ch]
-                else:
-                    pad = np.repeat(arr[-1:], self.in_ch - arr.shape[0], axis=0)
-                    arr = np.concatenate([arr, pad], axis=0)
-
-            arr = arr.astype(np.float32)
-
-            p1, p99 = np.percentile(arr, [1, 99])
-            if p99 > p1:
-                arr = np.clip(arr, p1, p99)
-
-            mu = float(arr.mean())
-            sd = float(arr.std())
-            if sd < 1e-6:
-                sd = 1.0
-
-            arr = np.clip((arr - mu) / sd, -5.0, 5.0).astype(np.float32)
-
-            if self.train and self.augment is not None:
-                arr = self.augment(arr)
-
-            x_img = torch.from_numpy(arr.astype(np.float32))
+            x_img = torch.from_numpy(self._load_patch(str(self.df.iloc[idx]["path"])))
         else:
             x_img = torch.zeros((1, 1, 1, 1), dtype=torch.float32)
 
@@ -350,7 +385,7 @@ class LungDataset(Dataset):
 
         ld_raw = self.df.iloc[idx].get("long_diameter", np.nan)
         ld_z = 0.0 if pd.isna(ld_raw) else (float(ld_raw) - self.ld_mu) / self.ld_std
-        ld_z = torch.tensor(ld_z, dtype=torch.float32)
+        ld_z = torch.tensor(float(ld_z), dtype=torch.float32)
 
         y = torch.tensor(int(self.y[idx]), dtype=torch.long)
 
@@ -370,7 +405,7 @@ def evaluate(
     del kwargs
 
     if task != "tri":
-        raise ValueError("This public release supports the tri-class task only.")
+        raise ValueError("Only tri-class classification is supported in this release.")
 
     model.eval()
 
@@ -418,7 +453,9 @@ def dump_val_predictions_from_best(
     out_name: str = "preds_val.csv",
 ) -> None:
     if task != "tri":
-        raise ValueError("This public release supports the tri-class task only.")
+        raise ValueError("Only tri-class classification is supported in this release.")
+
+    import os.path as osp
 
     ckpt_path = osp.join(out_dir, "best.pt")
     ckpt = torch.load(ckpt_path, map_location=device)
